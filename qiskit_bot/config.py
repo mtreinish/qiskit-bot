@@ -45,7 +45,9 @@ schema = vol.Schema({
         vol.Optional('default_branch', default='master'): str,
         vol.Optional('branch_on_release', default=False): bool,
         vol.Optional('optional_package', default=False): bool,
-        vol.Optional('uses_community_label', default=False): bool
+        vol.Optional('uses_community_label', default=False): bool,
+        vol.Optional('bump_version', default=False): bool,
+        vol.Optional('python_package_name'): str,
     }]),
 })
 

@@ -23,11 +23,122 @@ from functools import partial
 import fasteners
 from packaging.version import parse
 import github
+import tomli
+import tomli_w
+import yaml
 
 from qiskit_bot import config
 from qiskit_bot import git
 
 LOG = logging.getLogger(__name__)
+
+
+def _update_versions_everywhere(repo, new_version_number, from_main=False, stable_branch=None):
+    version_file = repo.config.get("python_package_name",
+                                   repo.name.replace('-', '_'))
+    with open(os.path.join(version_file, 'VERSION.txt'),
+              'wt', encoding='utf8') as fd:
+        fd.write(new_version_number)
+    # Try to update mergify if we're on the main branch and we branch on release
+    if from_main and repo.config.get('branch_on_release'):
+        if os.path.isfile(".mergify.yml"):
+            with open(".mergify.yml", "r") as fd:
+                mergify_data = yaml.safe_load(fd)
+            for index, action_dict in enumerate(mergify_data['pull_request_rules']):
+                if 'backport' in action_dict['actions']:
+                    mergify_data['pull_request_rules'][index]['action']['backport']['branches'] = [stable_branch]
+                    break
+            with open(".mergify.yml", "w") as fd:
+                yaml.dump(mergify_data, fd)
+
+    if os.path.isfile('Cargo.tonl'):
+        with open("Cargo.toml", 'rb') as fd:
+            data = tomli.load(fd)
+        rust_package_name = data["package"]["name"]
+        data["package"]["version"] = new_version_number
+        with open("Cargo.toml", "wb") as fd:
+            tomli_w.dump(data, fd)
+    if os.path.isfile('Cargo.lock'):
+        cmd = ["cargo", "update", "-p", rust_package_name]
+        try:
+            LOG.info("Updating Cargo.lock file for %s" % repo.name)
+            subprocess.run(cmd, capture_output=True,check=True, cwd=repo.local_path)
+        except subprocess.CalledProcessError as e:
+            LOG.exception("Failed to update Cargo.lock\nstdout:\n%s\nstderr:\n%s"
+                          % (e.stdout, e.stderr))
+    if os.path.isfile('docs/conf.py'):
+        #TODO
+        pass
+
+
+def bump_post_release(repo, version_obj):
+    version_number_pieces = version_obj.base_version.split('.')
+    bump_stable = False
+    bump_main = False
+    # If we've released an intermediate rc there is nothing to bump
+    # as either the next release is final and requires a manual version
+    # bump to trigger the release or the rc will be bumped manually
+    # before the final release
+    if version_obj.is_prerelease and version_obj.pre[1] > 1:
+        return
+    elif version_obj.is_prerelease and version_obj.pre[1] == 1:
+        bump_main = True
+    elif version_number_pieces[2] == 0:
+        bump_main = True
+        if repo.config.get('branch_on_release'):
+            bump_stable = True
+    elif version_number_pieces[2] > 0:
+        bump_stable = True
+    branch_number = '.'.join(version_number_pieces[:2])
+    git.checkout_default_branch(repo, pull=True)
+    if bump_stable:
+        next_version = f"{version_number_pieces[0]}.{version_number_pieces[1]}.{version_number_pieces[2] + 1}"
+        version_file = repo.config.get("python_package_name", repo.name.replace('-', '_'))
+        with open(os.path.join(version_file, 'VERSION.txt'), 'rt', encoding='utf8') as fd:
+            file_version = fd.read()
+        # The version number in the stable branch is already up-to-date
+        if next_version == file_version:
+            break
+        git.create_branch('bump_stable_branch_version_by_bot', f"origin/stable/{branch_number}", repo)
+        _update_versions_everywhere(repo, next_version)
+        this_branch = f"stable/{branch_number}"
+        commit_summary = "Bump versions after {version_obj} release"
+        body = f"""Now that the {version_obj} release is out the door we can start
+developing the next release on this branch, {next_version}. This
+commit bumps all the version strings as appropriate to
+differentiate new commits to {this_branch} from the previous
+release.
+"""
+        commit_msg = f"{commit_summary}\n\n{body}"
+        git.create_git_commit_for_all(repo, commit_msg.encode('utf8'))
+        git.push_ref_to_github(repo, 'bump_stable_branch_version_by_bot')
+        repo.gh_repo.create_pull(commit_summary, base=this_branch,
+                                 head='bump_main_branch_version_by_bot', body=body)
+
+    git.checkout_default_branch(repo, pull=True)
+    if bump_main:
+        next_version = f"{version_number_pieces[0]}.{version_number_pieces[1] + 1}.{version_number_pieces[2]}"
+        version_file = repo.config.get("python_package_name", repo.name.replace('-', '_'))
+        with open(os.path.join(version_file, 'VERSION.txt'), 'rt', encoding='utf8') as fd:
+            file_version = fd.read()
+        # The version number in the stable branch is already up-to-date
+        if next_version == file_version:
+            break
+        branch_name = repo.repo_config.get('default_branch', 'master')
+        git.create_branch('bump_main_branch_version_by_bot', f"origin/{branch_name}", repo)
+        _update_versions_everywhere(repo, next_version, from_main=True, stable_branch=f"stable/{branch_number}")
+        commit_summary = "Bump versions after {version_obj} release"
+        body = f"""Now that the {version_obj} release is out the door we can start
+developing the next release on this branch, {next_version}. This
+commit bumps all the version strings as appropriate to
+differentiate new commits to {branch_name} from the previous
+release.
+"""
+        commit_msg = f"{commit_summary}\n\n{body}"
+        git.create_git_commit_for_all(repo, commit_msg.encode('utf8'))
+        git.push_ref_to_github(repo, 'bump_main_branch_version_by_bot')
+        repo.gh_repo.create_pull(commit_summary, base=branch_name,
+                                 head='bump_main_branch_version_by_bot', body=body)
 
 
 def bump_meta(meta_repo, repo, version_number):
@@ -318,3 +429,11 @@ def finish_release(version_number, repo, conf, meta_repo):
             meta_repo,
         )
         multiprocessing.Process(target=_meta_process).start()
+
+    def _bump_post_process():
+        with fasteners.InterProcessLock(os.path.join(lock_dir,
+                                                     meta_repo.name)):
+            bump_post_release(repo, version_obj)
+
+    if repo.repo_config.get('bump_version'):
+        multiprocessing.Process(target=_bump_post_process).start()

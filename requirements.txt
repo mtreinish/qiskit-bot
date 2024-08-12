@@ -9,3 +9,5 @@ PyGithub>=1.43
 fasteners>=0.15
 voluptuous>=0.11.0
 packaging
+tomli>=1.1.0
+tomli-w>=1.0.0
